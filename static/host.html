@@ -13,6 +13,7 @@
 
   <div id="content">
     <p id="published-banner" class="banner" hidden>已公布：参与者现在可以看到自己收到的匿名意见，稿件与意见均已锁定。</p>
+    <p id="closed-banner" class="banner banner-closed" hidden>本会话已永久封存：仅供双方只读查阅，所有写操作（改稿、意见、问答、确认已读、举报、换发链接与举报裁定）均已停用。封存不删除数据、不作废链接。</p>
 
     <section class="card">
       <h2>互评进度</h2>
@@ -24,9 +25,12 @@
       <p class="muted" id="ack-note" hidden>已读回执按留存名单原顺序显示：作者在其页面明确确认已读后记为"已确认"并给出首次确认时间；此处不展示意见或问答内容。</p>
       <div class="row-actions">
         <button id="publish" class="primary" disabled>全部公布</button>
+        <button id="close-session" class="link-danger" type="button" hidden>永久封存（只读归档）</button>
       </div>
       <p class="muted">只有每篇当前稿件都有有效意见时才能公布；公布为一次性操作，公布后稿件与意见均不可再改。</p>
+      <p class="muted" id="close-note" hidden>已公布、且没有未答复的澄清问题与待处理举报时，主持人可将本会话永久封存：封存为一次性操作，封存后双方仍可凭原链接只读查阅全部内容，但任何写请求都会被拒绝（409）；数据不删除、链接不作废，读取权限、匿名隔离与屏蔽语义不变。</p>
       <p id="error" class="error"></p>
+      <p id="close-error" class="error"></p>
     </section>
 
     <section id="reports-section" class="card" hidden>

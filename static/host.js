@@ -3,6 +3,7 @@
 const token = location.pathname.split("/").filter(Boolean)[1];
 const errorEl = document.getElementById("error");
 const publishBtn = document.getElementById("publish");
+const closeBtn = document.getElementById("close-session");
 
 async function refresh() {
   let s;
@@ -25,14 +26,22 @@ async function refresh() {
 
 function render(s) {
   document.getElementById("published-banner").hidden = !s.published;
+  // 封存提示：封存后主持台一切写操作入口禁用，只保留只读展示与原链接
+  const closed = !!s.closed;
+  document.getElementById("closed-banner").hidden = !closed;
+  document.getElementById("close-note").hidden = !(s.published && !closed);
+  closeBtn.hidden = !(s.published && !closed);
+  closeBtn.disabled = closed;
 
   const pending = s.reviewers.filter((r) => !r.submitted).map((r) => r.name);
   const acked = s.reviewers.filter((r) => r.acknowledged).length;
-  document.getElementById("pending-summary").textContent = s.published
-    ? "互评已结束。已读回执：" + acked + "/" + s.reviewers.length + " 已确认。"
-    : pending.length
-      ? "待交人员：" + pending.join("、")
-      : "全部已交，可以公布。";
+  document.getElementById("pending-summary").textContent = closed
+    ? "会话已永久封存，以下为封存时的只读快照。已读回执：" + acked + "/" + s.reviewers.length + " 已确认。"
+    : s.published
+      ? "互评已结束。已读回执：" + acked + "/" + s.reviewers.length + " 已确认。"
+      : pending.length
+        ? "待交人员：" + pending.join("、")
+        : "全部已交，可以公布。";
 
   // 已读回执列仅公布后展示（按留存名单原顺序），不含意见或问答内容
   document.getElementById("ack-head").hidden = !s.published;
@@ -59,9 +68,10 @@ function render(s) {
     tbody.appendChild(tr);
   }
 
-  renderReports(s.published ? (s.reports || []) : []);
+  renderReports(s.published ? (s.reports || []) : [], closed);
 
-  publishBtn.disabled = !s.can_publish;
+  // 封存后公布与所有主持写操作一并禁用（公布前本就禁用）
+  publishBtn.disabled = closed || !s.can_publish;
 
   const linksBody = document.getElementById("links");
   linksBody.innerHTML = "";
@@ -86,15 +96,16 @@ function render(s) {
     removeBtn.className = "link-danger remove-member";
     removeBtn.textContent = "移除成员";
     removeBtn.dataset.name = l.name;
-    // 公布后不可移除：按钮禁用
-    removeBtn.disabled = !!s.published;
+    // 公布后不可移除：按钮禁用；封存后换发也一律禁用
+    removeBtn.disabled = !!s.published || closed;
+    rotateBtn.disabled = closed;
     tdAction.append(rotateBtn, removeBtn);
     tr.append(tdName, tdLink, tdAction);
     linksBody.appendChild(tr);
   }
 }
 
-function renderReports(reports) {
+function renderReports(reports, closed) {
   document.getElementById("reports-section").hidden = !reports.length;
   const statusText = {
     pending: "待处理",
@@ -120,7 +131,7 @@ function renderReports(reports) {
     tdStatus.className = r.status === "pending" ? "pending" : "ok";
 
     const tdAction = document.createElement("td");
-    if (r.status === "pending") {
+    if (r.status === "pending" && !closed) {
       const keepBtn = document.createElement("button");
       keepBtn.type = "button";
       keepBtn.className = "link";
@@ -136,6 +147,9 @@ function renderReports(reports) {
       blockBtn.dataset.decision = "block";
 
       tdAction.append(keepBtn, blockBtn);
+    } else if (r.status === "pending" && closed) {
+      // 封存时已保证无待处理举报；此分支仅作异常状态下的只读兜底
+      tdAction.textContent = "已封存";
     } else {
       tdAction.textContent = "—";
     }
@@ -158,6 +172,38 @@ publishBtn.addEventListener("click", async () => {
     }
   } catch {
     errorEl.textContent = "网络错误，请重试";
+  }
+  refresh();
+});
+
+// 永久封存：一次性、不可恢复；仅已公布且无未答复问题、无待处理举报时服务端才接受
+closeBtn.addEventListener("click", async () => {
+  const closeError = document.getElementById("close-error");
+  closeError.textContent = "";
+  if (
+    !confirm(
+      "确定将本会话永久封存？\n" +
+        "· 封存为一次性操作，不能恢复；\n" +
+        "· 封存后双方仍可凭原链接只读查阅全部内容，但改稿、意见、问答、确认已读、\n" +
+        "  举报、换发链接与举报裁定等一切写请求都会被拒绝；\n" +
+        "· 仍有未答复的澄清问题或待处理举报时不能封存；\n" +
+        "· 封存不删除任何数据，也不作废链接，读取权限、匿名隔离与屏蔽语义不变。"
+    )
+  )
+    return;
+  closeBtn.disabled = true;
+  try {
+    const r = await fetch("/api/h/" + token + "/close", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) {
+      closeError.textContent = "封存失败：" + (data.error || "请刷新主持台后重试");
+      closeBtn.disabled = false;
+      return;
+    }
+  } catch {
+    closeError.textContent = "网络错误，请重试";
+    closeBtn.disabled = false;
+    return;
   }
   refresh();
 });

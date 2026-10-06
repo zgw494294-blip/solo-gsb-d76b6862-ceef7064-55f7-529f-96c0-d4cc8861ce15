@@ -51,6 +51,7 @@ const els = {
   reportId: document.getElementById("report-id"),
   reportReason: document.getElementById("report-reason"),
   reportStatus: document.getElementById("report-status"),
+  closedBanner: document.getElementById("closed-banner"),
 };
 
 let firstLoad = true;
@@ -154,6 +155,28 @@ function render(s) {
   renderReport(s.published ? s.report : null);
   renderQuestion(s.published ? s.received_clarification : null);
   renderAnswer(s.published ? s.my_review_clarification : null);
+
+  // 封存后：页面顶部只读提示，并禁用本页全部写控件（封存只发生在公布后，
+  // 问答/举报/回执区此时均已按快照展示）。原链接仍可读，匿名与屏蔽语义不变
+  els.closedBanner.hidden = !s.closed;
+  if (s.closed) {
+    for (const el of [
+      els.manuscript,
+      els.saveMs,
+      els.review,
+      els.submitReview,
+      els.confirmReread,
+      els.ackButton,
+      els.questionInput,
+      els.submitQuestion,
+      els.answerInput,
+      els.submitAnswer,
+      els.reportInput,
+      els.submitReport,
+    ]) {
+      el.disabled = true;
+    }
+  }
 
   firstLoad = false;
 }

@@ -26,6 +26,14 @@
   其发出或收到的意见均不计入公布条件；仅"原来评退出者"的人改评下一位留存成员
   （退出者原为当前首位时，即留存者中录入顺序最末的一位——末位评首位），
   其旧意见失效并换发新的匿名分配凭据，其他人的稿件、版本、意见与链接全部保留。
+- 公布后主持人可凭主持链接在主持台将会话永久封存（只读归档）：仅已公布、且没有未答复
+  澄清问题与待处理举报时可封存；封存不删除任何数据、不作废任何链接，原读取权限、匿名
+  隔离与屏蔽语义全部保留。封存与提问、举报、换发等写操作一样在 BEGIN IMMEDIATE 事务内
+  按提交顺序串行生效：封存先提交则后到的问题/举报整体 409；问题/举报先提交（留下未解决
+  事项）则封存整体 409，不留部分状态。封存成功后该会话一切合法写请求——改稿、意见、
+  提问、答复、确认已读（含重复确认）、举报、换发链接、移除、公布、举报裁定与重复封存
+  ——一律 409；状态读取两端照常，主持与参与状态在原字段之外同一快照返回 closed=true；
+  无效主持/个人链接仍返回 404。未封存会话的旧接口行为完全不变。
 - 参与状态随快照返回不暴露作者身份的分配凭据；提交意见同时校验凭据与稿件版本，
   分配改变后缺少凭据或沿用旧凭据一律 409（即使两篇稿件版本号相同）；分配从未变过时
   兼容不带凭据的旧提交格式。移除、意见提交与公布在写事务内按提交顺序串行生效。
@@ -57,6 +65,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     host_token TEXT NOT NULL UNIQUE,
     published INTEGER NOT NULL DEFAULT 0,
+    -- 永久封存（只读归档）：主持人在公布后封存；封存后本会话一切合法写入一律 409
+    closed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS participants (
@@ -126,16 +136,24 @@ def init_db():
     """建库建表（幂等），数据落盘在 DB_PATH，重启后保留。
 
     旧版数据库（无 clarifications / token_history / receipts / reports 表，或
-    participants 缺 active / assignment_nonce / assignment_gen 列）启动时自动补建
-    问答表、历史链接表、回执表、举报表与移除成员所需列，既有
-    sessions/participants/reviews 数据原样保留；
+    participants 缺 active / assignment_nonce / assignment_gen 列，或 sessions 缺
+    closed 列）启动时自动补建问答表、历史链接表、回执表、举报表与移除成员所需列，
+    并为 sessions 补封存状态列；既有 sessions/participants/reviews 数据原样保留；
     补列时为每位既有成员回填一个分配凭据（视为其当前分配从未变过，gen=0），
-    旧库因此自动支持移除成员、已读回执与意见举报（既有意见初始为未举报），无需手动迁移。
+    sessions.closed 回填为 0（既有会话默认未封存），
+    旧库因此自动支持移除成员、已读回执、意见举报与会话封存（既有意见初始为未举报、
+    既有会话初始为未封存；封存状态随原数据卷重启保留），无需手动迁移。
     """
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    session_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    if "closed" not in session_cols:
+        # 旧库既有会话默认未封存；封存状态与其他数据同在原 SQLite 文件中，重启保留
+        conn.execute("ALTER TABLE sessions ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
     cols = {
         r[1]
         for r in conn.execute("PRAGMA table_info(participants)").fetchall()
@@ -216,6 +234,14 @@ def find_session_by_host(conn, host_token):
     return conn.execute(
         "SELECT * FROM sessions WHERE host_token=?", (host_token,)
     ).fetchone()
+
+
+CLOSED_MESSAGE = "会话已永久封存，仅供只读查阅，不能再写入"
+
+
+def closed_error():
+    """封存后本会话一切合法写请求的统一拒绝（409，不改任何数据）。"""
+    return err(CLOSED_MESSAGE, 409)
 
 
 def find_participant(conn, token):
@@ -488,6 +514,8 @@ def host_status(host_token):
         return jsonify(
             {
                 "published": bool(session["published"]),
+                # 封存状态与原字段同一快照返回；封存后主持台只读提示并禁用全部写操作
+                "closed": bool(session["closed"]),
                 "can_publish": can_publish,
                 "reviewers": reviewers,
                 "reports": [host_report_view(r) for r in report_rows],
@@ -510,6 +538,9 @@ def publish(host_token):
         if session is None:
             conn.rollback()
             return err("主持链接无效", 404)
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         if session["published"]:
             conn.rollback()
             return err("已经公布过了", 409)
@@ -533,6 +564,66 @@ def publish(host_token):
         conn.execute("UPDATE sessions SET published=1 WHERE id=?", (session["id"],))
         conn.commit()
         return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@app.post("/api/h/<host_token>/close")
+def close_session(host_token):
+    """主持人把已公布的会话永久封存为只读归档（一次性，不可恢复）。
+
+    规则（全部在同一 BEGIN IMMEDIATE 写事务内"先检查后变更"，拒绝即整体回滚）：
+    - 主持链接无效 → 404；未公布 → 409；已经封存（重复封存）→ 409。
+    - 存在未答复的澄清问题（clarifications.answer IS NULL）或待处理举报
+      （reports.status='pending'）→ 409，且不改变封存状态与任何数据。
+    - 封存只把 sessions.closed 置 1：不删除任何数据、不作废任何链接，原读取权限、
+      匿名隔离与屏蔽语义全部保留。
+    - 封存与提问、举报、换发链接等写操作按提交顺序串行生效：封存先提交则其后到达的
+      问题/举报等写入整体 409；问题/举报先提交且留下未解决事项，则封存整体 409。
+    封存成功后，本会话的一切合法写请求（含重复确认已读与换发链接）及重复封存均 409；
+    两端状态读取照常，并在同一快照中返回 closed=true；无效链接仍为 404。
+    """
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        session = find_session_by_host(conn, host_token)
+        if session is None:
+            conn.rollback()
+            return err("主持链接无效", 404)
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
+        if not session["published"]:
+            conn.rollback()
+            return err("尚未公布，不能封存", 409)
+        # 未答复的澄清问题：一问一答未走完的会话不能封存，避免把悬而未决的问题归档
+        unanswered = conn.execute(
+            "SELECT 1 FROM clarifications c JOIN reviews r ON c.review_id=r.id"
+            " WHERE r.session_id=? AND c.answer IS NULL LIMIT 1",
+            (session["id"],),
+        ).fetchone()
+        if unanswered is not None:
+            conn.rollback()
+            return err("仍有未答复的澄清问题，不能封存", 409)
+        # 待处理举报：主持人尚未裁定（保留/屏蔽）的举报不能封存
+        pending = conn.execute(
+            "SELECT 1 FROM reports WHERE session_id=? AND status='pending' LIMIT 1",
+            (session["id"],),
+        ).fetchone()
+        if pending is not None:
+            conn.rollback()
+            return err("仍有待处理的举报，不能封存", 409)
+        # 条件更新兜底：并发封存最多一次把 0 改成 1，其余看到 closed=1 返回 409
+        cur = conn.execute(
+            "UPDATE sessions SET closed=1 WHERE id=? AND closed=0",
+            (session["id"],),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return closed_error()
+        conn.commit()
+        return jsonify({"ok": True, "closed": True})
     except Exception:
         conn.rollback()
         raise
@@ -572,6 +663,10 @@ def rotate_link(host_token):
         if participant is None:
             conn.rollback()
             return err("本会话中没有该成员", 404)
+        # 封存后换发链接也是写入：一律 409，链接保持不变
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         # 所见链接必须与该成员当前链接一致：已作废的旧链接/他人链接/伪造链接均 409
         if participant["token"] != seen_token:
             conn.rollback()
@@ -630,6 +725,9 @@ def remove_participant(host_token):
         if session is None:
             conn.rollback()
             return err("主持链接无效", 404)
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         if session["published"]:
             conn.rollback()
             return err("已公布，不能再移除成员", 409)
@@ -714,6 +812,8 @@ def participant_state(token):
             "manuscript": me["manuscript"],
             "version": me["version"],
             "published": published,
+            # 封存状态与其他字段同一快照返回：封存后参与页只读提示并禁用全部写操作
+            "closed": bool(session["closed"]),
             # 匿名：不返回被评稿件作者的姓名；credential 是不暴露作者身份的分配凭据，
             # 提交意见时与稿件版本一并校验
             "assignment": {
@@ -787,8 +887,11 @@ def edit_manuscript(token):
             conn.rollback()
             return err("个人链接无效", 404)
         session = conn.execute(
-            "SELECT published FROM sessions WHERE id=?", (me["session_id"],)
+            "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
         ).fetchone()
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         if session["published"]:
             conn.rollback()
             return err("已公布，稿件不可再修改", 409)
@@ -833,8 +936,11 @@ def submit_review(token):
             conn.rollback()
             return err("个人链接无效", 404)
         session = conn.execute(
-            "SELECT published FROM sessions WHERE id=?", (me["session_id"],)
+            "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
         ).fetchone()
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         if session["published"]:
             conn.rollback()
             return err("已公布，意见不可再提交或修改", 409)
@@ -898,6 +1004,10 @@ def ask_clarification(token):
         session = conn.execute(
             "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
         ).fetchone()
+        # 封存后提问一律 409，且不改变任何数据
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         # 公布前提问一律 409，且不改变任何数据
         if not session["published"]:
             conn.rollback()
@@ -942,6 +1052,10 @@ def answer_clarification(token):
         session = conn.execute(
             "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
         ).fetchone()
+        # 封存后答复一律 409
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         # 公布前答复一律 409
         if not session["published"]:
             conn.rollback()
@@ -980,7 +1094,8 @@ def acknowledge_receipt(token):
 
     服务端凭个人链接确定作者及对应意见；首次成功记录确认时间，重复确认仍成功
     且不改首次时间。打开页面、轮询或提问都不会自动确认，只能显式调用本接口。
-    公布前一律 409；无效、已退出或已换发的旧个人链接一律 404；失败不写任何数据。
+    公布前一律 409；会话封存后（含重复确认）一律 409；无效、已退出或已换发的旧个人
+    链接一律 404；失败不写任何数据。
     确认只写入回执本身：稿件、意见与一问一答均不变，提问/答复权限不受影响；
     换发链接后回执随原身份（同一参与者行）保留。
     """
@@ -992,8 +1107,12 @@ def acknowledge_receipt(token):
             conn.rollback()
             return err("个人链接无效", 404)
         session = conn.execute(
-            "SELECT published FROM sessions WHERE id=?", (me["session_id"],)
+            "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
         ).fetchone()
+        # 封存后连"重复确认已读"也属于写请求：一律 409，首次确认时间不变
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         # 公布前确认一律 409，且不改变任何数据
         if not session["published"]:
             conn.rollback()
@@ -1041,6 +1160,10 @@ def report_received_review(token):
         session = conn.execute(
             "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
         ).fetchone()
+        # 封存后举报一律 409，且不改变任何数据
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         # 公布前举报一律 409，且不改变任何数据
         if not session["published"]:
             conn.rollback()
@@ -1085,6 +1208,10 @@ def decide_report(host_token, report_id, decision):
         if report is None:
             conn.rollback()
             return err("举报不存在", 404)
+        # 封存时已无 pending 举报；封存后到达的任何裁定均 409，裁定不改变
+        if session["closed"]:
+            conn.rollback()
+            return closed_error()
         if report["status"] != "pending":
             conn.rollback()
             return err("该举报已经处理，不能重复处理或修改", 409)

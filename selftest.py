@@ -170,6 +170,10 @@ def decide_report(client, host_token, report_id, decision):
     )
 
 
+def close_session(client, host_token):
+    return client.post(f"/api/h/{host_token}/close")
+
+
 def publish_with_reviews(client, host_token, tokens, reviews=("甲评乙", "乙评丙", "丙评甲")):
     """三人首轮意见全部提交并一次公布，返回各 token。"""
     for tok, content in zip(tokens, reviews):
@@ -1856,8 +1860,400 @@ class ReportTest(unittest.TestCase):
         )
 
 
+class CloseSessionTest(unittest.TestCase):
+    """主持人永久封存：404/409 规则、未解决事项门槛、封存后拒绝一切写入、
+    保留只读/匿名/屏蔽、与提问/举报按提交顺序生效、快照 closed 字段、持久化。"""
+
+    def setUp(self):
+        self.client = new_client()
+        self.host_token, self.tokens = create_session(self.client)
+        self.t_jia, self.t_yi, self.t_bing = self.tokens
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+
+    def participant_state(self, token):
+        resp = self.client.get(f"/api/p/{token}")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        return resp.get_json()
+
+    def host_state(self):
+        resp = self.client.get(f"/api/h/{self.host_token}")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        return resp.get_json()
+
+    def test_unpublished_and_invalid_link_and_repeat(self):
+        # 另开一个未公布会话：封存 409，且不写 closed
+        pre = new_client()
+        host2, tokens2 = create_session(pre)
+        resp = close_session(pre, host2)
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(pre.get(f"/api/h/{host2}").get_json()["closed"])
+        self.assertFalse(pre.get(f"/api/p/{tokens2[0]}").get_json()["closed"])
+
+        # 无效主持链接：404（不透露会话是否存在）
+        self.assertEqual(close_session(self.client, "假主持").status_code, 404)
+
+        # 本会话已公布：封存成功
+        resp = close_session(self.client, self.host_token)
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(resp.get_json(), {"ok": True, "closed": True})
+
+        # 重复封存：409，状态保持
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 409)
+        self.assertTrue(self.host_state()["closed"])
+
+    def test_unresolved_questions_and_pending_reports_block_close(self):
+        # 甲提问、丙尚未答复：存在未答复澄清问题，封存 409
+        self.assertEqual(ask(self.client, self.t_jia, "悬而未决的问题").status_code, 200)
+        resp = close_session(self.client, self.host_token)
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(self.host_state()["closed"])
+        self.assertFalse(self.participant_state(self.t_jia)["closed"])
+
+        # 丙答复后问答走完：可封存；但若同时存在待处理举报仍 409
+        self.assertEqual(answer(self.client, self.t_bing, "答复完毕").status_code, 200)
+        r = report_review(self.client, self.t_yi, "待处理举报")
+        self.assertEqual(r.status_code, 200)
+        report_id = r.get_json()["id"]
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 409)
+        self.assertFalse(self.host_state()["closed"])
+
+        # 主持人裁定（保留）后没有待处理举报：封存成功
+        self.assertEqual(
+            decide_report(self.client, self.host_token, report_id, "keep").status_code, 200
+        )
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+        self.assertTrue(self.host_state()["closed"])
+
+        # 被拒期间没有任何数据被改动：问题/答复/举报裁定都在
+        s = self.participant_state(self.t_jia)
+        self.assertEqual(
+            s["received_clarification"],
+            {"question": "悬而未决的问题", "answer": "答复完毕", "answered": True},
+        )
+        self.assertEqual(
+            self.participant_state(self.t_yi)["report"]["status"], "kept"
+        )
+
+    def test_all_writes_rejected_after_close_reads_intact(self):
+        # 封存前留下问答、回执、举报（已屏蔽）等只读内容
+        ask(self.client, self.t_jia, "甲的问题")
+        answer(self.client, self.t_bing, "丙的答复")
+        ack(self.client, self.t_jia)
+        rid = report_review(self.client, self.t_yi, "乙的举报").get_json()["id"]
+        decide_report(self.client, self.host_token, rid, "block")
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+
+        # 主持端一切合法写请求一律 409
+        self.assertEqual(
+            self.client.post(f"/api/h/{self.host_token}/publish").status_code, 409
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/h/{self.host_token}/rotate-link",
+                json={"name": "甲", "link": f"/p/{self.t_jia}"},
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/h/{self.host_token}/remove", json={"name": "甲"}
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/h/{self.host_token}/reports/{rid}/keep"
+            ).status_code,
+            409,
+        )
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 409)
+
+        # 参与端一切合法写请求一律 409（含重复确认已读）
+        self.assertEqual(
+            self.client.put(
+                f"/api/p/{self.t_jia}/manuscript", json={"manuscript": "偷改"}
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            submit_review(self.client, self.t_jia, "封存后意见", 1).status_code, 409
+        )
+        self.assertEqual(ask(self.client, self.t_yi, "封存后提问").status_code, 409)
+        self.assertEqual(answer(self.client, self.t_bing, "封存后答复").status_code, 409)
+        first_at = self.participant_state(self.t_jia)["receipt"]["acknowledged_at"]
+        # 重复确认已读：封存前是 200，封存后必须 409 且首次时间不变
+        resp = ack(self.client, self.t_jia)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(
+            self.participant_state(self.t_jia)["receipt"]["acknowledged_at"], first_at
+        )
+        self.assertEqual(
+            report_review(self.client, self.t_bing, "封存后举报").status_code, 409
+        )
+
+        # 无效链接仍是 404（而不是封存的 409）
+        self.assertEqual(self.client.get("/api/p/无效链接").status_code, 404)
+        self.assertEqual(
+            self.client.put(
+                "/api/p/无效链接/manuscript", json={"manuscript": "x"}
+            ).status_code,
+            404,
+        )
+        self.assertEqual(ask(new_client(), "无效链接", "q").status_code, 404)
+        self.assertEqual(
+            new_client().get("/api/h/无效主持").status_code, 404
+        )
+
+        # 两端读取照常，且同快照携带 closed=true
+        host = self.host_state()
+        self.assertTrue(host["closed"])
+        self.assertTrue(host["published"])
+        for tok in self.tokens:
+            self.assertTrue(self.participant_state(tok)["closed"])
+
+        # 封存不删除数据、不撤销链接、不改变匿名隔离与屏蔽语义
+        sj = self.participant_state(self.t_jia)
+        self.assertEqual(sj["name"], "甲")
+        self.assertEqual(sj["manuscript"], "文本一")
+        self.assertEqual(sj["received"], "丙评甲")
+        self.assertEqual(
+            sj["received_clarification"],
+            {"question": "甲的问题", "answer": "丙的答复", "answered": True},
+        )
+        self.assertEqual(sj["receipt"]["acknowledged_at"], first_at)
+        # 乙收到的甲意见此前已屏蔽：received 仍为 null，屏蔽标记仍在，问答/状态保留
+        sy = self.participant_state(self.t_yi)
+        self.assertIsNone(sy["received"])
+        self.assertTrue(sy["received_blocked"])
+        self.assertEqual(sy["report"]["status"], "blocked")
+        # 匿名隔离不变：参与页不出现他人姓名与任何链接
+        body = self.client.get(f"/api/p/{self.t_jia}").get_data(as_text=True)
+        self.assertNotIn(self.t_bing, body)
+        self.assertNotIn("host_token", body)
+        # 换发被 409 拒绝：主持台链接原样保留
+        self.assertEqual(
+            [l["url"].rsplit("/", 1)[-1] for l in host["links"]], self.tokens
+        )
+
+    def test_concurrent_close_first_blocks_question(self):
+        """封存先拿到写锁并提交：提问在封存提交后才继续，必须整体 409，不留问题。"""
+        close_entered = threading.Event()
+        release_close = threading.Event()
+        question_begin = threading.Event()
+        tls = threading.local()
+        armed = {"close": True}
+
+        def hook(_wrapper, sql):
+            if armed["close"] and sql.lstrip().upper().startswith("UPDATE SESSIONS SET CLOSED"):
+                armed["close"] = False
+                close_entered.set()
+                self.assertTrue(release_close.wait(10), "封存未被释放")
+
+        def pre_hook(_wrapper, sql):
+            if getattr(tls, "asker", False) and sql.lstrip().upper().startswith("BEGIN IMMEDIATE"):
+                self.assertFalse(release_close.is_set())
+                question_begin.set()
+
+        result = {}
+
+        def closer():
+            tls.closer = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["close"] = close_session(
+                    new_client(), self.host_token
+                ).status_code
+
+        t = threading.Thread(target=closer)
+        t.start()
+        self.assertTrue(close_entered.wait(10), "封存未进入更新阶段")
+
+        def asker():
+            tls.asker = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["question"] = ask(
+                    new_client(), self.t_jia, "卡在封存前的问题"
+                ).status_code
+
+        w = threading.Thread(target=asker)
+        w.start()
+        self.assertTrue(question_begin.wait(10), "提问未发起写事务")
+        time.sleep(0.2)
+        self.assertNotIn("question", result, "提问不应在封存提交前完成")
+        release_close.set()
+        t.join(10)
+        w.join(10)
+        self.assertFalse(t.is_alive() or w.is_alive())
+        self.assertEqual(result["close"], 200)
+        self.assertEqual(result["question"], 409)
+        # 封存成功且没有任何澄清行写入
+        self.assertTrue(self.host_state()["closed"])
+        self.assertIsNone(
+            self.participant_state(self.t_jia)["received_clarification"]
+        )
+
+    def test_concurrent_question_first_blocks_close(self):
+        """提问先拿到写锁并提交：封存等待后看到未答复问题，必须整体 409，未封存。"""
+        question_past = threading.Event()
+        release_question = threading.Event()
+        close_begin = threading.Event()
+        tls = threading.local()
+        armed = {"question": True}
+
+        def hook(_wrapper, sql):
+            if armed["question"] and "INSERT INTO CLARIFICATIONS" in sql.lstrip().upper():
+                armed["question"] = False
+                question_past.set()
+                self.assertTrue(release_question.wait(10), "提问未被释放")
+
+        def pre_hook(_wrapper, sql):
+            if getattr(tls, "closer", False) and sql.lstrip().upper().startswith("BEGIN IMMEDIATE"):
+                self.assertFalse(release_question.is_set())
+                close_begin.set()
+
+        result = {}
+
+        def asker():
+            tls.asker = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["question"] = ask(
+                    new_client(), self.t_jia, "先到的问题"
+                ).status_code
+
+        w = threading.Thread(target=asker)
+        w.start()
+        self.assertTrue(question_past.wait(10), "提问未进入写入阶段")
+
+        def closer():
+            tls.closer = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["close"] = close_session(
+                    new_client(), self.host_token
+                ).status_code
+
+        t = threading.Thread(target=closer)
+        t.start()
+        self.assertTrue(close_begin.wait(10), "封存未发起写事务")
+        time.sleep(0.2)
+        self.assertNotIn("close", result, "封存不应在提问提交前完成")
+        release_question.set()
+        w.join(10)
+        t.join(10)
+        self.assertFalse(w.is_alive() or t.is_alive())
+        self.assertEqual(result["question"], 200)
+        self.assertEqual(result["close"], 409)
+        # 问题已提交且会话未封存；答复后即可封存
+        self.assertFalse(self.host_state()["closed"])
+        self.assertEqual(
+            self.participant_state(self.t_jia)["received_clarification"]["question"],
+            "先到的问题",
+        )
+        self.assertEqual(answer(self.client, self.t_bing, "补上的答复").status_code, 200)
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+
+    def test_concurrent_report_first_blocks_close(self):
+        """举报先提交（留下 pending）：封存按提交顺序看到待处理举报，整体 409。"""
+        report_past = threading.Event()
+        release_report = threading.Event()
+        close_begin = threading.Event()
+        tls = threading.local()
+        armed = {"report": True}
+
+        def hook(_wrapper, sql):
+            if armed["report"] and "INSERT INTO REPORTS" in sql.lstrip().upper():
+                armed["report"] = False
+                report_past.set()
+                self.assertTrue(release_report.wait(10), "举报未被释放")
+
+        def pre_hook(_wrapper, sql):
+            if getattr(tls, "closer", False) and sql.lstrip().upper().startswith("BEGIN IMMEDIATE"):
+                self.assertFalse(release_report.is_set())
+                close_begin.set()
+
+        result = {}
+
+        def reporter():
+            tls.reporter = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["report"] = report_review(
+                    new_client(), self.t_jia, "先到的举报"
+                ).status_code
+
+        w = threading.Thread(target=reporter)
+        w.start()
+        self.assertTrue(report_past.wait(10), "举报未进入写入阶段")
+
+        def closer():
+            tls.closer = True
+            with use_wrapped_db(hook, pre_hook=pre_hook):
+                result["close"] = close_session(
+                    new_client(), self.host_token
+                ).status_code
+
+        t = threading.Thread(target=closer)
+        t.start()
+        self.assertTrue(close_begin.wait(10), "封存未发起写事务")
+        release_report.set()
+        w.join(10)
+        t.join(10)
+        self.assertFalse(w.is_alive() or t.is_alive())
+        self.assertEqual(result["report"], 200)
+        self.assertEqual(result["close"], 409)
+        self.assertFalse(self.host_state()["closed"])
+        # 裁定后封存成功；成功后不能再产生新举报
+        rid = self.participant_state(self.t_jia)["report"]["id"]
+        self.assertEqual(
+            decide_report(self.client, self.host_token, rid, "block").status_code, 200
+        )
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+        self.assertEqual(
+            report_review(self.client, self.t_yi, "封存后举报").status_code, 409
+        )
+
+    def test_closed_flag_same_snapshot_and_persistence(self):
+        # 封存前两端快照 closed=false，与原字段并存
+        self.assertFalse(self.host_state()["closed"])
+        self.assertFalse(self.participant_state(self.t_jia)["closed"])
+
+        ask(self.client, self.t_jia, "问题")
+        answer(self.client, self.t_bing, "答复")
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 200)
+
+        # closed 与 published/receipt/clarification 等来自同一快照
+        s = self.participant_state(self.t_jia)
+        self.assertTrue(s["closed"])
+        self.assertTrue(s["published"])
+        self.assertEqual(s["received"], "丙评甲")
+        self.assertEqual(
+            s["received_clarification"],
+            {"question": "问题", "answer": "答复", "answered": True},
+        )
+        host = self.host_state()
+        self.assertTrue(host["closed"])
+        self.assertEqual([r["name"] for r in host["reviewers"]], ["甲", "乙", "丙"])
+
+        # 模拟重启：幂等建库后封存状态随原数据卷保留，仍只读
+        app_module.init_db()
+        self.assertTrue(self.host_state()["closed"])
+        self.assertTrue(self.participant_state(self.t_yi)["closed"])
+        self.assertEqual(close_session(self.client, self.host_token).status_code, 409)
+        self.assertEqual(ask(self.client, self.t_yi, "重启后提问").status_code, 409)
+        self.assertEqual(
+            self.client.post(
+                f"/api/h/{self.host_token}/rotate-link",
+                json={"name": "甲", "link": f"/p/{self.t_jia}"},
+            ).status_code,
+            409,
+        )
+        # 数据仍在、链接仍可读
+        self.assertEqual(
+            self.participant_state(self.t_jia)["received_clarification"]["answer"],
+            "答复",
+        )
+
+
 class OldSchemaMigrationTest(unittest.TestCase):
-    """旧库启动时自动支持问答、换发、移除、回执与举报存储：补表/补列/回填凭据，旧数据保留。"""
+    """旧库启动时自动支持问答、换发、移除、回执、举报与封存存储：补表/补列（含
+    sessions.closed）/回填凭据，旧数据保留。"""
 
     OLD_SCHEMA = """
     CREATE TABLE sessions (
@@ -1926,6 +2322,17 @@ class OldSchemaMigrationTest(unittest.TestCase):
             self.assertIn("token_history", tables)
             self.assertIn("receipts", tables)
             self.assertIn("reports", tables)
+            # sessions 自动补封存状态列，既有会话默认未封存
+            c2 = sqlite3.connect(old_path)
+            try:
+                sess_cols = {
+                    r[1] for r in c2.execute("PRAGMA table_info(sessions)").fetchall()
+                }
+                closed_default = c2.execute("SELECT closed FROM sessions").fetchone()[0]
+            finally:
+                c2.close()
+            self.assertIn("closed", sess_cols)
+            self.assertEqual(closed_default, 0)
 
             # 旧数据原样保留，且新表可直接读写
             client = new_client()
@@ -2091,6 +2498,61 @@ class OldSchemaMigrationTest(unittest.TestCase):
                 {"acknowledged": True, "acknowledged_at": first_at},
             )
             self.assertEqual(ack(client, "tk").get_json()["acknowledged_at"], first_at)
+        finally:
+            app_module.DB_PATH = original
+
+    def test_old_db_close_column_backfilled_and_close_works(self):
+        """旧库 sessions 无 closed 列：自动补列且默认未封存；封存后重启仍只读。"""
+        tmp_dir = tempfile.mkdtemp(prefix="review-olddb-close-")
+        old_path = os.path.join(tmp_dir, "old.db")
+        conn = sqlite3.connect(old_path)
+        conn.executescript(self.OLD_SCHEMA)
+        conn.execute("INSERT INTO sessions (id, host_token, published) VALUES (1,'ht',1)")
+        conn.execute(
+            "INSERT INTO participants (id, session_id, token, name, position, manuscript, version)"
+            " VALUES (1,1,'tk','旧库作者',0,'旧稿',1)"
+        )
+        conn.execute(
+            "INSERT INTO reviews (id, session_id, reviewer_id, target_id, target_version, content, valid)"
+            " VALUES (1,1,1,1,1,'旧意见',1)"
+        )
+        conn.commit()
+        conn.close()
+
+        original = app_module.DB_PATH
+        app_module.DB_PATH = old_path
+        try:
+            app_module.init_db()
+            client = new_client()
+            # 补列后既有会话默认未封存：可问可答，closed=false
+            self.assertFalse(client.get("/api/h/ht").get_json()["closed"])
+            self.assertFalse(client.get("/api/p/tk").get_json()["closed"])
+            self.assertEqual(ask(client, "tk", "旧库问题").status_code, 200)
+            # 有未答复问题时不能封存
+            self.assertEqual(close_session(client, "ht").status_code, 409)
+
+            # 自问自答（单人环里评审者即作者自己）后封存成功
+            self.assertEqual(answer(client, "tk", "旧库答复").status_code, 200)
+            resp = close_session(client, "ht")
+            self.assertEqual(resp.status_code, 200, resp.get_json())
+            self.assertTrue(client.get("/api/h/ht").get_json()["closed"])
+            self.assertTrue(client.get("/api/p/tk").get_json()["closed"])
+            # 封存后写入 409、读取与数据不变、链接不作废
+            self.assertEqual(ask(client, "tk", "封存后提问").status_code, 409)
+            self.assertEqual(client.get("/api/p/tk").status_code, 200)
+            self.assertEqual(client.get("/api/p/tk").get_json()["received"], "旧意见")
+            self.assertEqual(
+                client.post(
+                    "/api/h/ht/rotate-link",
+                    json={"name": "旧库作者", "link": "/p/tk"},
+                ).status_code,
+                409,
+            )
+            # 重启：封存状态随原数据卷保留，重复封存仍 409
+            app_module.init_db()
+            self.assertTrue(client.get("/api/h/ht").get_json()["closed"])
+            self.assertEqual(close_session(client, "ht").status_code, 409)
+            self.assertEqual(ack(client, "tk").status_code, 409)
         finally:
             app_module.DB_PATH = original
 
