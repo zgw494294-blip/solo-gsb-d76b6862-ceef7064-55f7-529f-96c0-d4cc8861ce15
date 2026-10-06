@@ -13,6 +13,16 @@
 
   <div id="content">
     <p id="published-banner" class="banner" hidden>已公布：参与者现在可以看到自己收到的匿名意见，稿件与意见均已锁定。</p>
+    <p id="closed-banner" class="banner" hidden>本会话已永久封存：双方仅可只读查阅，所有写操作均已停用；封存不删除任何数据，主持链接与个人链接继续保留。</p>
+
+    <section id="close-section" class="card" hidden>
+      <h2>封存会话</h2>
+      <p class="muted">公布后，在没有未答复澄清问题、没有待处理举报时，可将本会话永久封存，供双方只读查阅。封存为一次性操作：封存后提问、答复、确认已读、举报与换发链接等一切写入都将被拒绝；数据与链接均保留，匿名、只读查看不受影响。</p>
+      <div class="row-actions">
+        <button id="close-session" class="link-danger" type="button">永久封存本会话</button>
+      </div>
+      <p id="close-error" class="error"></p>
+    </section>
 
     <section class="card">
       <h2>互评进度</h2>

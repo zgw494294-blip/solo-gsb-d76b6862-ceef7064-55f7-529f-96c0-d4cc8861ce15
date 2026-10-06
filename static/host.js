@@ -25,6 +25,10 @@ async function refresh() {
 
 function render(s) {
   document.getElementById("published-banner").hidden = !s.published;
+  document.getElementById("closed-banner").hidden = !s.closed;
+  // 封存区仅公布后、未封存时出现；封存后一切主持写操作按钮禁用
+  document.getElementById("close-section").hidden = !s.published || !!s.closed;
+  publishBtn.disabled = !s.can_publish || !!s.closed;
 
   const pending = s.reviewers.filter((r) => !r.submitted).map((r) => r.name);
   const acked = s.reviewers.filter((r) => r.acknowledged).length;
@@ -61,8 +65,6 @@ function render(s) {
 
   renderReports(s.published ? (s.reports || []) : []);
 
-  publishBtn.disabled = !s.can_publish;
-
   const linksBody = document.getElementById("links");
   linksBody.innerHTML = "";
   for (const l of s.links) {
@@ -86,7 +88,8 @@ function render(s) {
     removeBtn.className = "link-danger remove-member";
     removeBtn.textContent = "移除成员";
     removeBtn.dataset.name = l.name;
-    // 公布后不可移除：按钮禁用
+    // 公布后不可移除：按钮禁用；封存后换发同样停用
+    rotateBtn.disabled = !!s.closed;
     removeBtn.disabled = !!s.published;
     tdAction.append(rotateBtn, removeBtn);
     tr.append(tdName, tdLink, tdAction);
@@ -158,6 +161,36 @@ publishBtn.addEventListener("click", async () => {
     }
   } catch {
     errorEl.textContent = "网络错误，请重试";
+  }
+  refresh();
+});
+
+// 永久封存：仅公布后、无未答澄清且无待处理举报时可成功；封存后双方只读
+document.getElementById("close-session").addEventListener("click", async () => {
+  const closeError = document.getElementById("close-error");
+  closeError.textContent = "";
+  if (
+    !confirm(
+      "确定永久封存本会话？\n" +
+        "封存后双方只能只读查阅：提问、答复、确认已读、举报、换发链接等一切写入都会被拒绝；\n" +
+        "封存不可撤销，但不会删除任何数据或链接，匿名与现有阅读权限保持不变。"
+    )
+  )
+    return;
+  const btn = document.getElementById("close-session");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/h/" + token + "/close", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) {
+      closeError.textContent = data.error || "封存失败，请刷新主持台后重试";
+      btn.disabled = false;
+      return;
+    }
+  } catch {
+    closeError.textContent = "网络错误，请重试";
+    btn.disabled = false;
+    return;
   }
   refresh();
 });

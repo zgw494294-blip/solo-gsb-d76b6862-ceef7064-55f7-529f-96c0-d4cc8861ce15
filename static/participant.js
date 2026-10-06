@@ -18,6 +18,7 @@ const els = {
   submitReview: document.getElementById("submit-review"),
   reviewMsg: document.getElementById("review-msg"),
   publishedBanner: document.getElementById("published-banner"),
+  closedBanner: document.getElementById("closed-banner"),
   receivedSection: document.getElementById("received-section"),
   received: document.getElementById("received"),
   ackBox: document.getElementById("ack-box"),
@@ -154,6 +155,19 @@ function render(s) {
   renderReport(s.published ? s.report : null);
   renderQuestion(s.published ? s.received_clarification : null);
   renderAnswer(s.published ? s.my_review_clarification : null);
+
+  // 封存：与其他字段同一快照返回；页面整体只读，停用一切写控件（含问答、回执、举报）。
+  // 放在子渲染之后，避免其把举报等按钮重新启用。
+  els.closedBanner.hidden = !s.closed;
+  if (s.closed) {
+    for (const el of [
+      els.manuscript, els.saveMs, els.review, els.submitReview,
+      els.questionInput, els.submitQuestion, els.answerInput, els.submitAnswer,
+      els.ackButton, els.reportInput, els.submitReport, els.confirmReread,
+    ]) {
+      el.disabled = true;
+    }
+  }
 
   firstLoad = false;
 }
